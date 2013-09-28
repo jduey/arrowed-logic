@@ -13,6 +13,8 @@
                  [org.clojure/clojurescript "0.0-1835"]
                  [org.clojure/tools.macro "0.1.1"]
                  [org.clojure/tools.nrepl "0.2.3"]
+                 [arrows "1.1.3"]
+                 [net.clojure/monads "1.0.2"]
                  [com.datomic/datomic-free "0.8.3551" :scope "provided"]]
 
   :plugins [[lein-cljsbuild "0.3.2"]]
