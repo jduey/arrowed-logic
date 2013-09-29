@@ -1136,14 +1136,14 @@
 ;; =============================================================================
 ;; drawing the search tree
 
-(defn make-tree
-  ([p] (make-tree p {} {} (fn [[g m]]
+(defn make-graph
+  ([p] (make-graph p {} {} (fn [[g m]]
                             [(v/append-dg g {:id (v/genkey)}) m])))
   ([p g m c]
      (build-tree ((get (meta p) :tree) g) m c)))
 
 (defn proc-to-dot [p]
-  (let [dg (first (make-tree p))]
+  (let [dg (first (make-graph p))]
     (->> dg
          (v/dg-to-dot)
          :body
@@ -1160,10 +1160,10 @@
   (goal empty-s))
 
 (defmacro run* [[x] & goals]
+  ;; TODO: thread this
   `(let [~x (clojure.core.logic/lvar '~x)
-         p# (arrows/seq ~@goals)
-         ans# (clojure.core.logic/run-logic p#)]
-     (map #(-reify % ~x) ans#)))
+         p# (first (clojure.core.logic/build-tree (clojure.core.logic/all ~@goals)))]
+     (map #(-reify % ~x) (clojure.core.logic/run-logic p#))))
 
 (defmacro run [n x & goals]
   `(take ~n (clojure.core.logic/run* ~x ~@goals)))
@@ -1179,12 +1179,13 @@
     (get (meta (first ps)) :tree)
     (fn [g]
       (tree-cc (fn [m c]
-                 (let [entry (v/genkey)]
-                   [(v/append-dg g (reduce add-branch
-                                           {:id (v/genkey)
-                                            :entry entry
-                                            entry {:id entry :next []}}
-                                           (map #(first (make-tree % {} m c)) ps)))
+                 (let [entry (v/genkey)
+                       bg (reduce add-branch
+                                  {:id (v/genkey)
+                                   :entry entry
+                                   entry {:id entry :next []}}
+                                  (map #(first (make-graph % {} m c)) ps))]
+                   [(v/append-dg g bg)
                     m]))))))
 
 (deftype logic-arr [fun meta-data]
@@ -1208,13 +1209,16 @@
                  :label ""}))
 
   (arrow-seq [p ps]
-    (let [ps (cons p ps)]
-      (logic-arr. (m/chain ps)
-                  {:op :arrow-seq
-                   :tree (->> ps
-                              (map #(get (meta %) :tree))
-                              m/chain)
-                   :args ps})))
+    (if (empty? ps)
+      p
+      (let [ps (cons p ps)]
+        (logic-arr. (m/chain ps)
+                    {:op :arrow-seq
+                     :tree (->> ps
+                                (map #(get (meta %) :tree))
+                                m/chain)
+                     ;; :args ps
+                     }))))
 
   ;; we can't define this for the logic arrow and don't need it anyway
   (arrow-nth [p n]
@@ -1228,7 +1232,7 @@
       (logic-arr. (fn [ss]
                     (logic-m (map #(%1 %2) ps ss)))
                   {:op :arrow-par
-                   :args ps
+                   ;; :args ps
                    :tree (par-to-tree ps)})))
 
   arrows.vis/ArrowVis
@@ -1251,28 +1255,50 @@
                :tree tree-m
                :label ""}))
 
-(def fail (logic-arr. (constantly logic-zero)
-                      {:op :arrow-arr
-                       :tree (fn [g]
-                               (tree-m (v/append-dg g {:id (v/genkey)
-                                                       :label "fail"})))}))
+(def fail (tree-m
+           (logic-arr. (fn [x]
+                         logic-zero)
+                       {:op :arrow-arr
+                        :tree (fn [g]
+                                (tree-cc
+                                 (fn [m c]
+                                   [(v/append-dg g {:id (v/genkey)
+                                                    :label "fail"})
+                                    m])))})))
 
 (defn == [u v]
-  (logic-arr. (fn [a]
-                (if-let [ap (unify a u v)]
-                  (logic-m ap)
-                  logic-zero))
-              {:op :arrow-arr
-               :tree (fn [g]
-                       (tree-m (v/append-dg g {:id (v/genkey)
-                                               :label (str u " == " v)})))}))
+  (tree-m
+   (logic-arr. (fn [a]
+                 (if-let [ap (unify a u v)]
+                   (logic-m ap)
+                   logic-zero))
+               {:op :arrow-arr
+                :tree (fn [g]
+                        (tree-m (v/append-dg g {:id (v/genkey)
+                                                ;:label (str u " == " v)
+                                                })))})))
 
-(def all a/seq)
+(defn all [& steps]
+  (if (= (count steps) 1)
+    (first steps)
+    ;; TODO: maybe find a way to a/seq all the steps at once
+    (m/bind (first steps)
+            (m/chain (map (fn [step]
+                            (fn [p]
+                              (tree-cc
+                               (fn [m c]
+                                 (let [[step-p new-m] (build-tree step m c)]
+                                   [(a/seq p step-p) new-m])))))
+                          (rest steps))))))
+
 (defn conde [& clauses]
-  (a/seq
-   (apply a/all (map #(apply a/seq %) clauses))
-   (logic-arr. m/plus
-               {:tree tree-m})))
+  (tree-cc
+   (fn [m c]
+     (let [clauses (map #(first (build-tree (apply all %) m c)) clauses)]
+       [(a/seq
+         (apply a/all clauses)
+         (logic-arr. m/plus {:tree tree-m}))
+        m]))))
 
 (defn- lvar-bind [sym]
   ((juxt identity
@@ -1288,53 +1314,61 @@
 ;; =============================================================================
 ;; defining recursive functions
 
-(defn- tree-fn [sym expr-fn]
-  (fn [g]
-    (tree-cc (fn [m c]
-               (if (contains? m sym)
-                 (let [id (v/genkey)]
-                   [(v/append-dg g {:id id
-                                    :next [{:to (get m sym)}]})
-                    m])
-                 (let [p (expr-fn)
-                       root-id (v/genkey)
-                       new-g (v/append-dg g
-                                          {:id (v/genkey)
-                                           :entry root-id
-                                           :exit root-id
-                                           root-id {:id root-id
-                                                    :label (str sym)}})]
-                   (make-tree p
-                              new-g
-                              (assoc m sym root-id)
-                              (fn [[g m]]
-                                (c [g (dissoc m sym)])))))))))
+(defn recursive-p [sym]
+  (logic-arr. (constantly logic-zero)
+              {:self-recursive #{sym}
+               :tree (fn [g]
+                       (tree-cc
+                        (fn [m c]
+                          (assert (contains? m sym))
+                          [(v/append-dg g {:id (v/genkey)
+                                           :next [{:to (get m sym)}]}) m])))}))
 
-(defmacro defno [sym args expr]
-  `(defn ~sym ~args
-     (let [recursive-p# (clojure.core.logic/logic-arr.
-                         (constantly clojure.core.logic/logic-zero)
-                         {:self-recursive #{'~sym}
-                          :tree (clojure.core.logic/tree-fn '~sym (fn [] ~expr))})
-           ~sym (fn ~args
-                  (clojure.core.logic/tree-cc (fn [m# c#]
-                                                [recursive-p# m#])))]
-       (clojure.core.logic/tree-cc
-        (fn [m# c#]
-          (if (contains? m# '~sym)
-            [recursive-p# m#]
-            (let [body-p# (clojure.core.logic/build-tree ~expr (conj m# '~sym))]
-              (if (and (= (get (meta body-p#) :results 0) 0)
-                       (= (arrows.vis/get-attr body-p# :self-recursive) #{'~sym}))
-                [clojure.core.logic/fail m#]
-                (c# [(arrows/set-attr
-                      body-p#
-                      :tree (clojure.core.logic/tree-fn '~sym (fn [] ~expr)))
-                     (conj m# '~sym)])))))))))
+(defn embed-tree [sym expr m c]
+  (let [[p new-m] (build-tree expr
+                              (conj m sym)
+                              (fn [[p m]]
+                                (c [p (disj m sym)])))]
+    [(a/set-attr p :tree (fn [g]
+                           (tree-cc
+                            (fn [m c]
+                              (let [root-id (v/genkey)
+                                    new-g (v/append-dg g {:id (v/genkey)
+                                                          :entry root-id
+                                                          :exit root-id
+                                                          root-id {:id root-id
+                                                                   :label (str sym)}})]
+                                (make-graph p
+                                           new-g
+                                           (assoc m sym root-id)
+                                           (fn [[g m]]
+                                             (c [g (dissoc m sym)])))))))) new-m]))
 
+(defmacro defno [sym args & body]
+  (let [expr (first body)
+        body (butlast body)]
+    `(defn ~sym ~args
+       ~@body
+       (let [~sym (constantly
+                   (clojure.core.logic/tree-cc
+                    (fn [m# c#]
+                      [(clojure.core.logic/recursive-p '~sym) m#])))]
+         (clojure.core.logic/tree-cc
+          (fn [m# c#]
+            (if (contains? m# '~sym)
+              [(clojure.core.logic/recursive-p '~sym) m#]
+              (clojure.core.logic/embed-tree '~sym ~expr m# c#))))))))
 
-(println)
-(prn (run* [q] (conde
+#_(prn (run* [q]
+           (fresh [x y]
+                  (== x :tea)
+                  (== y :cup)
+                  (== q (llist x y)))
+           (fresh [t u]
+                  (== t :tea)
+                  (== u :cup)
+                  (== q (llist t u)))))
+#_(prn (run* [q] (conde
                 [(== q :tea)]
                 [(== q :cup)]
                 [(== q :fail) fail]
@@ -1345,20 +1379,82 @@
 
 (def p (== (lvar) :a))
 
-(def p (a/seq
+#_(def p (all
         (== (lvar) :a)
         (== (lvar) :b)))
 
-(def p (conde
+#_(def p (conde
         [(== (lvar) :b)]
         [(== (lvar) :c)]))
 
-(defno a [q]
+#_(defno a [q]
   (== q :a))
 
 #_(def p (a (lvar)))
 
+(defno nevero [q]
+  (conde
+   [fail]
+   [(nevero q)]))
+
+(declare top)
+(defno bottom [q]
+  (top q))
+
+(defno middle [q]
+  (bottom q))
+
+(defno top [q]
+  (fresh [x y]
+         (conde
+          [(middle q) (== y :y)]
+          [(== x :x)])))
+
+(defno a [q]
+  (== q :a))
+
+(defno b [q]
+  (== q :b))
+
+(defno ab [q]
+  (conde
+   [(nevero q) (b q)]
+   [(nevero q)]
+   [(a q)]
+   [(conde
+     [fail]
+     [fail])]))
+
+(defno bad [q]
+  (conde
+   [(top q) (top q)]
+   [(ab q)]))
+
+#_(defno t [q]
+  (conde
+   [(== :x :x)]
+   [(t q)]))
+
+(defno diverge [q]
+  (diverge q))
+
+(println)
+
+(defno pf [q]
+  (conde
+   [fail]
+   [fail]))
+
+(def p (bad (lvar)))
+
+(println "-----------")
 (->> p
+     (build-tree)
+     (first)
      (proc-to-dot)
      (format "digraph G {\n%s}")
      (spit "bogus.dot"))
+
+#_(println)
+(prn (run* [q]
+           (bad q)))
