@@ -1244,29 +1244,23 @@
                (remove #(= 0 (v/get-attr % :results)) ps)
                ps)
           self-recursive (apply set/union (map #(get (meta %) :self-recursive) ps))]
-      (cond
-       (empty? ps)
-       (logic-arr. (constantly logic-zero)
-                   {:op :arrow-arr
-                    :fail true
-                    :results 0
-                    :tree (fn [g]
-                            (tree-cc
-                             (fn [m c]
-                               [(v/append-dg g {:id (v/genkey)
-                                                :label "fail"})
-                                m])))})
-
-       (= (count ps) 1)
-       (first ps)
-
-       :else
-       (logic-arr. (fn [ss]
-                     (logic-m (map #(%1 %2) ps ss)))
-                   {:op :arrow-par
-                    :self-recursive self-recursive
-                    :results (reduce #(+ %1 %2) (map #(get (meta %) :results 1) ps))
-                    :tree (par-to-tree ps)}))))
+      (if (empty? ps)
+        (logic-arr. (constantly logic-zero)
+                    {:op :arrow-arr
+                     :fail true
+                     :results 0
+                     :tree (fn [g]
+                             (tree-cc
+                              (fn [m c]
+                                [(v/append-dg g {:id (v/genkey)
+                                                 :label "fail"})
+                                 m])))})
+        (logic-arr. (fn [ss]
+                      (m/join (logic-m (mapcat #(%1 %2) ps ss))))
+                    {:op :arrow-par
+                     :self-recursive self-recursive
+                     :results (reduce #(+ %1 %2) (map #(get (meta %) :results 1) ps))
+                     :tree (par-to-tree ps)}))))
 
   arrows.vis/ArrowVis
   (get-attr [p attr-key]
@@ -1330,16 +1324,10 @@
 (defn conde [& clauses]
   (tree-cc
    (fn [m c]
-     (let [clauses (map #(first (build-tree (apply all %) m c)) clauses)
-           clauses-p (apply a/par clauses)]
-       [(logic-arr. (m/chain [(fn [s]
-                                (logic-m (repeat (count clauses) s)))
-                              clauses-p
-                              (fn [ss]
-                                (m/plus ss))])
-                    (assoc (meta clauses-p)
-                      :conde true))
-        m]))))
+     [(->> clauses
+           (map #(first (build-tree (apply all %) m c)))
+           (apply a/all))
+      m])))
 
 (defn- lvar-bind [sym]
   ((juxt identity
